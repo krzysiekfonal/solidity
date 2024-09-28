@@ -10,6 +10,9 @@ target_link_libraries(solfuzzer PRIVATE libsolc evmasm Boost::boost Boost::progr
 add_executable(yulopti yulopti.cpp)
 target_link_libraries(yulopti PRIVATE solidity Boost::boost Boost::program_options Boost::system)
 
+add_executable(yuloptiml yuloptiforml.cpp)
+target_link_libraries(yuloptiml PRIVATE solidity Boost::boost Boost::program_options Boost::system)
+
 add_executable(isoltest
 	isoltest.cpp
 	IsolTestOptions.cpp

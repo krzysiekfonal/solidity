@@ -28,14 +28,12 @@
 #include <libsolidity/parsing/Parser.h>
 #include <libyul/AST.h>
 #include <libyul/AsmParser.h>
-#include <libyul/AsmPrinter.h>
+#include <libyul/ObjectParser.h>
 #include <libyul/Object.h>
 #include <liblangutil/SourceReferenceFormatter.h>
 
 #include <libyul/optimiser/Disambiguator.h>
 #include <libyul/optimiser/OptimiserStep.h>
-#include <libyul/optimiser/StackCompressor.h>
-#include <libyul/optimiser/VarNameCleaner.h>
 #include <libyul/optimiser/Suite.h>
 
 #include <libyul/backends/evm/EVMDialect.h>
@@ -83,40 +81,64 @@ public:
 		}.printErrorInformation(_errors);
 	}
 
-	void parse(std::string const& _input)
+	void parse(std::string const& _input, std::string const& _name = "")
 	{
 		ErrorList errors;
 		ErrorReporter errorReporter(errors);
-		CharStream _charStream(_input, "");
+		//std::string source = print(nullptr /* _soliditySourceProvider */);
+		m_charStream = std::make_unique<CharStream>(_input, _name);
 		try
 		{
-			auto ast = yul::Parser(errorReporter, m_dialect).parse(_charStream);
-			if (!ast || errorReporter.hasErrors())
+			std::shared_ptr<Scanner> scanner = std::make_shared<Scanner>(*m_charStream);
+			auto rootObj = yul::ObjectParser(errorReporter, m_dialect).parse(scanner, false);
+			if (!rootObj || errorReporter.hasErrors())
 			{
 				std::cerr << "Error parsing source." << std::endl;
-				printErrors(_charStream, errors);
+				printErrors(*m_charStream, errors);
 				throw std::runtime_error("Could not parse source.");
 			}
-			m_astRoot = std::make_shared<yul::Block>(std::get<yul::Block>(ASTCopier{}(ast->root())));
-			m_analysisInfo = std::make_unique<yul::AsmAnalysisInfo>();
-			AsmAnalyzer analyzer(
-				*m_analysisInfo,
-				errorReporter,
-				m_dialect
-			);
-			if (!analyzer.analyze(*m_astRoot) || errorReporter.hasErrors())
-			{
-				std::cerr << "Error analyzing source." << std::endl;
-				printErrors(_charStream, errors);
-				throw std::runtime_error("Could not analyze source.");
+			m_rootObj = rootObj;
+			if (!analyzeParsed(*m_rootObj, errorReporter)) {
+				std::cerr << "Error while analysing source." << std::endl;
+				printErrors(*m_charStream, errors);
+				throw std::runtime_error("Could not analyse source.");
 			}
 		}
 		catch(...)
 		{
 			std::cerr << "Fatal error during parsing: " << std::endl;
-			printErrors(_charStream, errors);
+			printErrors(*m_charStream, errors);
 			throw;
 		}
+	}
+
+	bool analyzeParsed(Object& _object, ErrorReporter& errorReporter) {
+		_object.analysisInfo = std::make_shared<AsmAnalysisInfo>();
+
+		AsmAnalyzer analyzer(
+			*_object.analysisInfo,
+			errorReporter,
+			m_dialect,
+			{},
+			_object.qualifiedDataNames()
+		);
+
+		bool success = false;
+		try
+		{
+			success = analyzer.analyze(_object.code()->root());
+			for (auto& subNode: _object.subObjects)
+				if (auto subObject = dynamic_cast<Object*>(subNode.get()))
+					if (!analyzeParsed(*subObject, errorReporter))
+						success = false;
+		}
+		catch (UnimplementedFeatureError const& _error)
+		{
+			errorReporter.unimplementedFeatureError(1920_error, _error.sourceLocation(), *_error.comment());
+			success = false;
+		}
+
+		return success;
 	}
 
 	void printUsageBanner(
@@ -168,80 +190,65 @@ public:
 		}
 	}
 
-	void disambiguate()
+	yul::Block disambiguate(const yul::Object& yulObj)
 	{
-		*m_astRoot = std::get<yul::Block>(Disambiguator(m_dialect, *m_analysisInfo)(*m_astRoot));
-		m_analysisInfo.reset();
-		m_nameDispenser.reset(*m_astRoot);
+		auto astRoot = std::get<yul::Block>(Disambiguator(m_dialect, *yulObj.analysisInfo)(yulObj.code()->root()));
+		m_nameDispenser.reset(astRoot);
+
+		return astRoot;
 	}
 
-	void runSteps(std::string _source, std::string _steps)
-	{
+	void begin(std::string _source) {
 		parse(_source);
-		disambiguate();
-		OptimiserSuite{m_context}.runSequence(_steps, *m_astRoot);
-		std::cout << AsmPrinter{}(*m_astRoot) << std::endl;
+		runSteps(*m_rootObj, "hgfo", false);
+
+		parse(m_rootObj->toString(), m_charStream->name()); // reparse
+		std::cout << m_rootObj->toString();
 	}
 
-	void runInteractive(std::string _source, bool _disambiguated = false)
+	void end(std::string _source) {
+		parse(_source);
+		runSteps(*m_rootObj, "g", false);
+		parse(m_rootObj->toString(), m_charStream->name()); // reparse
+		std::cout << m_rootObj->toString();
+	}
+
+	void steps(std::string _source, std::string _steps) {
+		parse(_source);
+		runSteps(*m_rootObj, _steps, false);
+		parse(m_rootObj->toString(), m_charStream->name()); // reparse
+		std::cout << m_rootObj->toString();
+	}
+
+	void toJson(std::string _source) {
+		parse(_source);
+		std::cout << m_rootObj->toJson();
+	}
+
+	void runSteps(yul::Object& _object, std::string _steps, bool _isCreation)
 	{
-		bool disambiguated = _disambiguated;
-		while (true)
-		{
-			parse(_source);
-			disambiguated = disambiguated || (disambiguate(), true);
-			std::map<char, std::string> const& extraOptions = {
-				// QUIT starts with a non-letter character on purpose to get it to show up on top of the list
-				{'#', ">>> QUIT <<<"},
-				{',', "VarNameCleaner"},
-				{';', "StackCompressor"}
-			};
-
-			printUsageBanner(extraOptions, 4);
-			std::cout << "? ";
-			std::cout.flush();
-			char option = static_cast<char>(readStandardInputChar());
-			std::cout << ' ' << option << std::endl;
-
-			try
+		for (auto& subNode: _object.subObjects)
+			if (auto subObject = dynamic_cast<Object*>(subNode.get()))
 			{
-				switch (option)
-				{
-					case 4:
-					case '#':
-						return;
-					case ',':
-						VarNameCleaner::run(m_context, *m_astRoot);
-						// VarNameCleaner destroys the unique names guarantee of the disambiguator.
-						disambiguated = false;
-						break;
-					case ';':
-					{
-						Object obj;
-						obj.setCode(std::make_shared<AST>(std::get<yul::Block>(ASTCopier{}(*m_astRoot))));
-						*m_astRoot = std::get<1>(StackCompressor::run(m_dialect, obj, true, 16));
-						break;
-					}
-					default:
-						OptimiserSuite{m_context}.runSequence(
-							std::string_view(&option, 1),
-							*m_astRoot
-						);
-				}
-				_source = AsmPrinter{}(*m_astRoot);
+				bool isCreation = !boost::ends_with(subObject->name, "_deployed");
+				runSteps(*subObject, _steps, isCreation);
 			}
-			catch (...)
-			{
-				std::cerr << std::endl << "Exception during optimiser step:" << std::endl;
-				std::cerr << boost::current_exception_diagnostic_information() << std::endl;
-			}
-			std::cout << "----------------------" << std::endl;
-			std::cout << _source << std::endl;
-		}
+
+		auto astRoot = disambiguate(_object);
+		OptimiserStepContext context{
+			m_dialect,
+			m_nameDispenser,
+			m_reservedIdentifiers,
+			_isCreation ? std::nullopt : std::make_optional(solidity::frontend::OptimiserSettings::standard().expectedExecutionsPerDeployment)
+		};
+		OptimiserSuite{context}.runSequence(_steps, astRoot);
+		_object.setCode(std::make_shared<AST>(std::move(astRoot)));
+		_object.analysisInfo = std::make_shared<AsmAnalysisInfo>(AsmAnalyzer::analyzeStrictAssertCorrect(m_dialect, _object));
 	}
 
 private:
-	std::shared_ptr<yul::Block> m_astRoot;
+	std::shared_ptr<yul::Object> m_rootObj;
+	std::unique_ptr<langutil::CharStream> m_charStream;
 	Dialect const& m_dialect{EVMDialect::strictAssemblyForEVMObjects(EVMVersion{})};
 	std::unique_ptr<AsmAnalysisInfo> m_analysisInfo;
 	std::set<YulName> const m_reservedIdentifiers = {};
@@ -258,10 +265,9 @@ int main(int argc, char** argv)
 {
 	try
 	{
-		bool nonInteractive = false;
 		po::options_description options(
-			R"(yulopti, yul optimizer exploration tool.
-	Usage: yulopti [Options] <file>
+			R"(yuloptiforml, yul optimizer exploration tool.
+	Usage: yuloptiforml [Options] <file>
 	Reads <file> as yul code and applies optimizer steps to it,
 	interactively read from stdin.
 	In non-interactive mode a list of steps has to be provided.
@@ -275,18 +281,20 @@ int main(int argc, char** argv)
 				"input-file",
 				po::value<std::string>(),
 				"input file"
-			)
-			(
+			)(
 				"steps",
 				po::value<std::string>(),
 				"steps to execute non-interactively"
-			)
-			(
-				"non-interactive,n",
-				po::bool_switch(&nonInteractive)->default_value(false),
-				"stop after executing the provided steps"
-			)
-			("help,h", "Show this help screen.");
+			)(
+				"begin",
+				"init steps to execute non-interactively"
+			)(
+				"end",
+				"final steps to execute non-interactively"
+			)(
+				"json",
+				"print json representation of the contract"
+			)("help,h", "Show this help screen.");
 
 		// All positional options should be interpreted as input files
 		po::positional_options_description filesPositions;
@@ -310,7 +318,6 @@ int main(int argc, char** argv)
 			std::string filename = arguments["input-file"].as<std::string>();
 			if (filename == "-")
 			{
-				nonInteractive = true;
 				input = readUntilEnd(std::cin);
 			}
 			else
@@ -322,26 +329,24 @@ int main(int argc, char** argv)
 			return 1;
 		}
 
-		if (nonInteractive && !arguments.count("steps"))
-		{
-			std::cout << options;
-			return 1;
-		}
-
 		YulOpti yulOpti;
-		bool disambiguated = false;
-		if (!nonInteractive)
-			std::cout << input << std::endl;
 		if (arguments.count("steps"))
 		{
 			std::string sequence = arguments["steps"].as<std::string>();
-			if (!nonInteractive)
-				std::cout << "----------------------" << std::endl;
-			yulOpti.runSteps(input, sequence);
-			disambiguated = true;
+			yulOpti.steps(input, sequence);
 		}
-		if (!nonInteractive)
-			yulOpti.runInteractive(input, disambiguated);
+		if (arguments.count("begin"))
+		{
+			yulOpti.begin(input);
+		}
+		if (arguments.count("end"))
+		{
+			yulOpti.end(input);
+		}
+		if (arguments.count("json"))
+		{
+			yulOpti.toJson(input);
+		}
 
 		return 0;
 	}

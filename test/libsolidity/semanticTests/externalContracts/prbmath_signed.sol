@@ -1,6 +1,3 @@
-==== ExternalSource: _prbmath/PRBMathCommon.sol ====
-==== ExternalSource: _prbmath/PRBMathSD59x18.sol ====
-==== Source: prbmath.sol ====
 import "_prbmath/PRBMathSD59x18.sol";
 
 contract test {
